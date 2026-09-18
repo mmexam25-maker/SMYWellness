@@ -113,6 +113,8 @@ public class ChapterRunner {
         }
         options.addArguments("--window-size=1366,768");
         options.addArguments("--disable-gpu");
+        options.addArguments("--disable-dev-shm-usage");
+        options.addArguments("--no-sandbox");
         options.addArguments("--disable-notifications");
         options.addArguments("--disable-popup-blocking");
         options.addArguments("--disable-extensions");
@@ -132,6 +134,8 @@ public class ChapterRunner {
         options.addArguments("--disable-domain-reliability");
         options.addArguments("--disable-features=Translate,MediaRouter,OptimizationHints,AutofillServerCommunication,BackForwardCache");
         
+        configureRailwayChromium(options);
+
         WebDriver driver = null;
         boolean browserPermitHeld = false;
         boolean closeBrowserAutomatically = true;
@@ -1921,6 +1925,25 @@ public class ChapterRunner {
         return message.length() <= 220
                 ? message
                 : message.substring(0, 217) + "...";
+    }
+
+    /**
+     * Railway/Linux helper. On Windows/local machines this does nothing.
+     * Railway installs chromium + chromium-driver through railpack.json.
+     */
+    private static void configureRailwayChromium(ChromeOptions options) {
+        java.io.File chromium = new java.io.File("/usr/bin/chromium");
+        java.io.File chromedriver = new java.io.File("/usr/bin/chromedriver");
+
+        if (chromium.isFile()) {
+            options.setBinary(chromium.getAbsolutePath());
+            System.out.println("CHROME BINARY: " + chromium.getAbsolutePath());
+        }
+
+        if (chromedriver.isFile()) {
+            System.setProperty("webdriver.chrome.driver", chromedriver.getAbsolutePath());
+            System.out.println("CHROMEDRIVER: " + chromedriver.getAbsolutePath());
+        }
     }
 
     private static WebDriver startChromeWithMemoryGuard(ChromeOptions options) throws Exception {
