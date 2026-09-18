@@ -1,0 +1,11 @@
+{
+  "$schema": "https://schema.railpack.com",
+  "deploy": {
+    "aptPackages": [
+      "...",
+      "chromium",
+      "chromium-driver",
+      "firefox-esr"
+    ]
+  }
+}
