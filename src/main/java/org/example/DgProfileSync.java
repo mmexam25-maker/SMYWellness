@@ -288,6 +288,36 @@ public final class DgProfileSync {
         );
     }
 
+    /**
+     * Railway/Linux browser paths. Local Windows execution is unchanged.
+     */
+    private static void configureRailwayChromium(ChromeOptions options) {
+        java.io.File chromium = new java.io.File("/usr/bin/chromium");
+        java.io.File chromedriver = new java.io.File("/usr/bin/chromedriver");
+
+        if (chromium.isFile()) {
+            options.setBinary(chromium.getAbsolutePath());
+            System.out.println("PROFILE CHROME BINARY: " + chromium.getAbsolutePath());
+        }
+
+        if (chromedriver.isFile()) {
+            System.setProperty("webdriver.chrome.driver", chromedriver.getAbsolutePath());
+            System.out.println("PROFILE CHROMEDRIVER: " + chromedriver.getAbsolutePath());
+        }
+    }
+
+    private static void configureRailwayFirefox(FirefoxOptions options) {
+        java.io.File firefox = new java.io.File("/usr/bin/firefox-esr");
+        if (!firefox.isFile()) {
+            firefox = new java.io.File("/usr/bin/firefox");
+        }
+
+        if (firefox.isFile()) {
+            options.setBinary(firefox.getAbsolutePath());
+            System.out.println("DG FIREFOX BINARY: " + firefox.getAbsolutePath());
+        }
+    }
+
     private static WebDriver createSmyProfileChromeDriver(Path workingDir) {
         ChromeOptions options = new ChromeOptions();
         options.setPageLoadStrategy(PageLoadStrategy.EAGER);
@@ -311,9 +341,13 @@ public final class DgProfileSync {
 
         options.addArguments("--window-size=1366,768");
         options.addArguments("--disable-gpu");
+        options.addArguments("--disable-dev-shm-usage");
+        options.addArguments("--no-sandbox");
         options.addArguments("--disable-notifications");
         options.addArguments("--disable-popup-blocking");
         options.addArguments("--no-first-run");
+
+        configureRailwayChromium(options);
 
         WebDriver driver = new ChromeDriver(options);
         try {
@@ -359,6 +393,8 @@ public final class DgProfileSync {
         if (!ChapterRunner.showBrowserForTesting()) {
             options.addArguments("-headless");
         }
+
+        configureRailwayFirefox(options);
 
         WebDriver driver = new FirefoxDriver(options);
         try {
