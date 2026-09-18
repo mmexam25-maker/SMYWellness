@@ -1,566 +1,1528 @@
 package org.example;
 
-import java.nio.file.Path;
+import java.io.File;
+import java.nio.file.Files;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Semaphore;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class Main {
 
-    // Per-PC worker count. Each computer reads its own PCn sheet tab.
-    private static final int MAX_PARALLEL_USERS = intSetting("MAX_PARALLEL_USERS", 1);
-    // Fast pickup/retry. The 429 fix is done by caching/de-duplicating Sheet
-    // calls below, so active users do not need a long polling gap.
-    private static final long SHEET_POLL_MS = 3_000L;
-    private static final long SHEET_ERROR_BACKOFF_MS = 5_000L;
+    private static final long POLL_MS = 15_000L;
+    private static final long RETRY_MS = 20_000L;
 
-    /*
-     * COLUMN F still stops e-learning for a completed candidate.
-     * IMPORTANT PHOTO FIX: a completed row with column V blank is NOT ignored.
-     * We still open SMY Profile in the lightweight/background profile worker:
-     *   - if a real photo is already there -> write "Photo Exist" to U
-     *   - if the photo is missing -> run the existing DG photo upload flow
-     * E-learning itself is never reopened for that completed row.
-     */
-    private static final long COMPLETED_PHOTO_RETRY_MS = 60_000L;
-    private static final Map<Integer, Long> COMPLETED_PHOTO_RETRY_AFTER =
-            new ConcurrentHashMap<>();
+    private static final ZoneId INDIA_ZONE =
+            ZoneId.of("Asia/Kolkata");
+
+    private static final DateTimeFormatter COMPLETED_AT_FORMAT =
+            DateTimeFormatter.ofPattern("dd/MM/yyyy hh:mm:ss a");
 
 
-    /*
-     * Continuous module order.
-     * This is the old Day 1 -> Day 2 -> Day 3 order flattened into one list.
-     * There is NO normal gap between modules and NO next-day gate.
-     */
-    private static final List<String> CONTINUOUS_MODULE_ORDER = List.of(
+    // =========================================================
+    // REQUIRED ASSESSMENT COURSES
+    // =========================================================
+
+    private static final List<String> REQUIRED_COURSES = List.of(
+
             "Emotional Wellness",
             "Economic Wellness",
-            "Physical Wellness",
-            "Social Wellness",
-            "Occupational Wellness",
             "Environmental Wellness",
+            "Physical Wellness",
             "Intellectual Wellness",
+            "Occupational Wellness",
+            "Social Wellness",
             "Spiritual Wellness",
             "Climatic Wellness",
             "Cultural Wellness"
     );
 
+
+    /*
+     * Protect against duplicate email in same Java run.
+     *
+     * Example:
+     * SMTP succeeds
+     * but Column I update temporarily fails.
+     *
+     * We must NOT send the email again.
+     */
+    private static final Set<Integer> EMAILED_THIS_RUN =
+            ConcurrentHashMap.newKeySet();
+
+    private static volatile boolean COMPLETED_REPAIR_DONE = false;
+
+
+    // =========================================================
+    // MAIN
+    // =========================================================
+
     public static void main(String[] args) {
 
-        // Show only useful progress + critical errors in the console.
-        CompactConsole.install();
+        ShortConsole.install();
+        System.out.println("START");
 
-        ExecutorService workers =
-                Executors.newFixedThreadPool(MAX_PARALLEL_USERS);
+        System.out.println(
+                "SMY - 10 ASSESSMENT CERTIFICATES"
+                        + " -> EMAIL"
+                        + " -> CANDIDATE WHATSAPP"
+                        + " -> OPTIONAL AGENT WHATSAPP"
+        );
 
-        Set<Integer> rowsInProgress =
-                ConcurrentHashMap.newKeySet();
+        System.out.println("NO GOOGLE DRIVE UPLOAD IS USED.");
 
-        // Reserve a slot only when a worker can actually start.
-        // Users are handled in normal local PC sheet-row order.
-        Semaphore workerSlots =
-                new Semaphore(MAX_PARALLEL_USERS);
+        System.out.println(
+                "PROFILE CACHE: Column D = Name, Column E = WhatsApp No. Missing values are read from Profile in hidden Chrome."
+        );
 
-        try {
-            List<QuizPlanRow> quizPlan =
-                    SheetRepository.readQuizPlan();
+        System.out.println(
+                "Agent email CC and agent WhatsApp are taken from config.properties."
+        );
 
-            printSchedule();
+        System.out.println(
+                "Successful rows are moved to Completed sheet."
+        );
 
-            while (!Thread.currentThread().isInterrupted()) {
-                try {
-                    // ONE API read gets this PC's own sheet rows.
-                    List<UserCourseRow> users =
-                            SheetRepository.readAllUsers();
+        System.out.println(
+                "New rows are watched continuously."
+                        + " FAILED rows are retried automatically."
+        );
 
-                    for (UserCourseRow user : users) {
-                        int row = user.sheetRowNumber();
 
-                        if (user.username() == null || user.username().isBlank()) {
-                            continue;
-                        }
+        // =====================================================
+        // CONTINUOUS WATCH
+        // =====================================================
 
-                        if (user.password() == null || user.password().isBlank()) {
-                            SheetRepository.updateOverallStatus(row, "Password Missing");
-                            continue;
-                        }
-
-                        // COLUMN F = master e-learning status. Never reopen
-                        // wellness modules for a completed row. But if U is blank,
-                        // still check the SMY profile/photo in the separate profile
-                        // worker so existing photos are marked and missing photos
-                        // can still be uploaded.
-                        if ("Completed".equalsIgnoreCase(user.status().trim())) {
-                            // Keep the certificate-download queue in sync even for
-                            // candidates that were already Completed before this build.
-                            try {
-                                SheetRepository.copyCompletedCandidateToDownloadCertificate(
-                                        row,
-                                        user.username(),
-                                        user.password(),
-                                        user.studentName(),
-                                        user.mobileNumber()
-                                );
-                            } catch (Exception queueError) {
-                                System.out.println(
-                                        "CERTIFICATE QUEUE SYNC FAILED | ROW " + row
-                                                + " | " + conciseError(queueError)
-                                );
-                            }
-
-                            boolean identityMissing = user.studentName() == null
-                                    || user.studentName().trim().isBlank()
-                                    || user.mobileNumber() == null
-                                    || user.mobileNumber().trim().isBlank();
-
-                            if (!DgProfileSync.isPhotoAlreadyMarked(user.photoStatus())
-                                    || identityMissing) {
-                                long now = System.currentTimeMillis();
-                                long retryAfter = COMPLETED_PHOTO_RETRY_AFTER
-                                        .getOrDefault(row, 0L);
-
-                                if (now >= retryAfter) {
-                                    COMPLETED_PHOTO_RETRY_AFTER.put(
-                                            row,
-                                            now + COMPLETED_PHOTO_RETRY_MS
-                                    );
-
-                                    try {
-                                        Path workingDir =
-                                                DgProfileSync.prepareWorkingDirectory(row);
-
-                                        System.out.println(
-                                                "PROFILE CHECK | ROW " + row
-                                                        + " | E=Completed"
-                                                        + (identityMissing ? " | C/D missing" : " | U blank")
-                                        );
-
-                                        DgProfileSync.startParallelSync(
-                                                user.username(),
-                                                user.password(),
-                                                user.studentName(),
-                                                user.mobileNumber(),
-                                                user.indosNumber(),
-                                                user.changedDgPassword(),
-                                                user.aadhaarNumber(),
-                                                row,
-                                                workingDir
-                                        );
-                                    } catch (Exception photoCheckError) {
-                                        System.out.println(
-                                                "PHOTO CHECK FAILED | ROW " + row
-                                                        + " | " + conciseError(photoCheckError)
-                                        );
-                                    }
-                                }
-                            }
-                            continue;
-                        }
-
-                        // FAST CONTINUOUS MODE:
-                        // Ignore/clear every old WAIT or DAY schedule status.
-                        // No module/day/retry interval is allowed to block a user.
-                        if (isAnyLegacyWaitStatus(user.status())) {
-                            try {
-                                SheetRepository.updateOverallStatus(row, "Ready");
-                            } catch (Exception clearWaitError) {
-                                System.out.println("Could not clear old wait for row "
-                                        + row + ": " + conciseError(clearWaitError));
-                            }
-                        }
-
-                        /*
-                         * IMPORTANT:
-                         * Old statuses such as
-                         *   DAY 2 START AFTER ...
-                         *   DAY 1 WAIT 1 HOUR UNTIL ...
-                         * are old formats and are intentionally ignored.
-                         * No schedule/wait status blocks fast continuous mode.
-                         */
-
-                        if (rowsInProgress.contains(row)) {
-                            continue;
-                        }
-
-                        if (!workerSlots.tryAcquire()) {
-                            // All four PC1 worker slots are already occupied.
-                            // Refresh the sheet again after the normal polling interval.
-                            break;
-                        }
-
-                        if (!rowsInProgress.add(row)) {
-                            workerSlots.release();
-                            continue;
-                        }
-
-                        workers.submit(() -> {
-                            try {
-                                processOneUser(user, quizPlan);
-                            } finally {
-                                rowsInProgress.remove(row);
-                                workerSlots.release();
-                            }
-                        });
-                    }
-
-                } catch (Exception pollingError) {
-                    System.out.println();
-                    System.out.println("SHEET/NETWORK REFRESH PAUSED: "
-                            + conciseError(pollingError));
-                    System.out.println("Refreshing again after a short technical backoff.");
-                    sleepSafely(SHEET_ERROR_BACKOFF_MS);
-                }
-
-                sleepSafely(SHEET_POLL_MS);
-            }
-
-        } catch (Exception mainError) {
-            System.out.println("MAIN PAUSED: " + conciseError(mainError));
-
-        } finally {
-            workers.shutdownNow();
-        }
-    }
-
-    private static void processOneUser(
-            UserCourseRow user,
-            List<QuizPlanRow> quizPlan
-    ) {
-        int row = user.sheetRowNumber();
-        String displayName =
-                user.studentName() == null || user.studentName().isBlank()
-                        ? user.username()
-                        : user.studentName();
-
-        try {
-            System.out.println();
-            System.out.println("####################################");
-            System.out.println("STARTING USER : " + displayName);
-            System.out.println("SHEET ROW     : " + row);
-            System.out.println("MODE          : ALL PENDING MODULES - NO GAP");
-            System.out.println("####################################");
-
-            SheetRepository.formatPendingRow(row);
-
-            /*
-             * STRICT ONE-BY-ONE MODE:
-             * Every module is checked against the website in order.
-             * ChapterRunner stops at the first module that is still Pending,
-             * so a later course can never start while an earlier one is
-             * incomplete. There is NO time gap between verified modules.
-             */
-            /*
-             * CRITICAL FIX: do NOT use old G:P "Completed" values to decide
-             * which modules to skip. Older code may have written Completed
-             * while the SMY page still showed Pending. Queue all 10 modules;
-             * ChapterRunner opens each module and Course skips only chapters
-             * whose WEBSITE HEADER itself is green Completed.
-             */
-            List<String> modulesToCheck =
-                    CONTINUOUS_MODULE_ORDER;
-
-            System.out.println();
-            System.out.println("STRICT SEQUENTIAL MODULES : " + modulesToCheck.size());
-            System.out.println("NEXT MODULE              : " + modulesToCheck.get(0));
-            for (String module : modulesToCheck) {
-                System.out.println(" - QUEUED " + module);
-            }
-
-            SheetRepository.updateOverallStatus(
-                    row,
-                    "Running"
-            );
-
-            /*
-             * Keep one login/browser session for this user and complete every
-             * pending module continuously. The browser closes only after this
-             * user's pending module list has been processed.
-             */
-            ChapterRunner.runMatchingModulesAndChapters(
-                    user.username(),
-                    user.password(),
-                    modulesToCheck,
-                    quizPlan,
-                    row,
-                    user.studentName(),
-                    user.mobileNumber(),
-                    user.indosNumber(),
-                    user.changedDgPassword(),
-                    user.aadhaarNumber(),
-                    user.photoStatus()
-            );
-
-            // One fresh G:P read after the complete continuous run.
-            List<String> freshStatuses =
-                    SheetRepository.readModuleStatuses(row);
-
-            List<String> remainingModules =
-                    findIncompleteModules(freshStatuses);
-
-            if (remainingModules.isEmpty()) {
-                markFullyCompleted(
-                        row,
-                        displayName,
-                        user.username(),
-                        user.password(),
-                        user.studentName(),
-                        user.mobileNumber()
-                );
-                return;
-            }
-
-            // No retry interval. Leave the row ready for the next worker pass
-            // immediately after the current browser session is closed.
-            SheetRepository.updateOverallStatus(row, "Retrying");
-
-            System.out.println();
-            System.out.println("CONTINUOUS RUN ENDED WITH PENDING MODULES.");
-            System.out.println("REMAINING MODULES : " + remainingModules);
-            System.out.println("RETRY MODE        : IMMEDIATE - NO GAP");
-
-        } catch (Exception userError) {
-            System.out.println();
+        while (!Thread.currentThread().isInterrupted()) {
 
             try {
-                SheetRepository.formatPendingRow(row);
 
-                if (isLowMemoryProblem(userError)) {
-                    SheetRepository.updateOverallStatus(row, "Retrying - Memory");
-                    System.out.println("LOW MEMORY - WILL RETRY ON NEXT PASS: " + displayName);
+                SheetRepository sheet =
+                        new SheetRepository();
 
-                } else if (isNetworkOrLoginProblem(userError)) {
-                    SheetRepository.updateOverallStatus(row, "Retrying - Network");
-                    System.out.println("NETWORK/LOGIN PROBLEM - WILL RETRY ON NEXT PASS.");
-                    System.out.println("USER : " + displayName);
+                if (!COMPLETED_REPAIR_DONE) {
+                    int repaired = sheet.repairShiftedCompletedRows();
+                    if (repaired > 0) {
+                        System.out.println("COMPLETED SHEET REPAIRED: " + repaired + " shifted row(s)");
+                    }
+                    COMPLETED_REPAIR_DONE = true;
+                }
+
+                Candidate candidate =
+                        sheet.findNext();
+
+
+                // -------------------------------------------------
+                // NOTHING PENDING
+                // -------------------------------------------------
+
+                if (candidate == null) {
+
+                    System.out.println(
+                            "No pending row. Checking again..."
+                    );
+
+                    sleep(POLL_MS);
+
+                    continue;
+                }
+
+
+                System.out.println("TRYING ROW " + candidate.rowNumber());
+
+                // -------------------------------------------------
+                // EMAIL ALREADY SENT DURING THIS JAVA RUN
+                //
+                // SMTP succeeded but sheet Column I write may have
+                // temporarily failed.
+                //
+                // Repair Column I only.
+                // DO NOT SEND EMAIL AGAIN.
+                // -------------------------------------------------
+
+                if (EMAILED_THIS_RUN.contains(
+                        candidate.rowNumber()
+                )) {
+
+                    try {
+
+                        sheet.updateMailStatusVerified(
+                                candidate.rowNumber(),
+                                "SENT"
+                        );
+
+                        EMAILED_THIS_RUN.remove(
+                                candidate.rowNumber()
+                        );
+
+                        sheet.updateProcessStatus(
+                                candidate.rowNumber(),
+                                "EMAIL SENT - CONTINUING WHATSAPP"
+                        );
+
+                    } catch (Exception e) {
+
+                        System.err.println(
+                                "EMAIL ALREADY SENT"
+                                        + " - RETRYING COLUMN I WRITE: "
+                                        + shortMsg(e)
+                        );
+
+                        sleep(RETRY_MS);
+
+                        continue;
+                    }
+                }
+
+
+                // -------------------------------------------------
+                // ONE EMAIL WAS ALREADY SENT
+                //
+                // Useful after restart where process status says
+                // all email parts completed but Column I was not
+                // successfully updated.
+                //
+                // Never resend.
+                // -------------------------------------------------
+
+                if (!"sent".equalsIgnoreCase(
+                        candidate.mailStatus()
+                )
+                        && isAllEmailPartsSent(
+                        candidate.processStatus()
+                )) {
+
+                    sheet.updateMailStatusVerified(
+                            candidate.rowNumber(),
+                            "SENT"
+                    );
+
+                    sheet.updateProcessStatus(
+                            candidate.rowNumber(),
+                            "EMAIL SENT - CONTINUING WHATSAPP"
+                    );
+
+                    finishWhatsappAndMove(
+                            sheet,
+                            candidate,
+                            resolveCandidateMobileForWhatsapp(sheet, candidate)
+                    );
+
+                    continue;
+                }
+
+
+                // -------------------------------------------------
+                // COLUMN I ALREADY SENT
+                //
+                // Skip:
+                // - login
+                // - download
+                // - email
+                //
+                // Only finish WhatsApp + move.
+                // -------------------------------------------------
+
+                if ("sent".equalsIgnoreCase(
+                        candidate.mailStatus()
+                )) {
+
+                    finishWhatsappAndMove(
+                            sheet,
+                            candidate,
+                            resolveCandidateMobileForWhatsapp(sheet, candidate)
+                    );
+
+                    continue;
+                }
+
+
+                // -------------------------------------------------
+                // NORMAL NEW / FAILED ROW
+                // -------------------------------------------------
+
+                processEmailWhatsappAndMove(
+                        sheet,
+                        candidate
+                );
+
+
+            } catch (Exception e) {
+
+                System.err.println("FAILED - RETRY");
+
+                sleep(RETRY_MS);
+            }
+        }
+    }
+
+
+    // =========================================================
+    // COMPLETE EMAIL + WHATSAPP + MOVE WORKFLOW
+    // =========================================================
+
+    private static void processEmailWhatsappAndMove(
+            SheetRepository sheet,
+            Candidate candidate
+    ) {
+
+        int row =
+                candidate.rowNumber();
+
+        boolean emailSent =
+                false;
+
+
+        try {
+
+            // -----------------------------------------------------
+            // VALIDATE LOGIN
+            // -----------------------------------------------------
+
+            if (candidate.loginId() == null
+                    || candidate.loginId().isBlank()
+                    || candidate.password() == null
+                    || candidate.password().isBlank()) {
+
+                throw new IllegalStateException(
+                        "Column B login/email"
+                                + " or Column C password is blank"
+                );
+            }
+
+
+            sheet.updateProcessStatus(
+                    row,
+                    "RUNNING - FILTERING ASSESSMENT"
+                            + " + DOWNLOADING 10 CERTIFICATES"
+            );
+
+
+            // -----------------------------------------------------
+            // DOWNLOAD CERTIFICATES
+            // -----------------------------------------------------
+
+            SagarCertificateBot bot =
+                    new SagarCertificateBot();
+
+
+            Map<String, File> courseFiles =
+                    Collections.synchronizedMap(
+                            new LinkedHashMap<>()
+                    );
+
+
+            // Email greeting uses Candidate Name from Column D. If Column D is blank,
+            // the headless certificate bot reads the name from the SMY Profile and
+            // writes it back to Column D before the email is sent.
+            // WhatsApp uses Column E in the same way.
+            final String[] resolvedName = { clean(candidate.candidateName()) };
+            final String[] resolvedMobile = { normalizeMobile(candidate.mobileNumber()) };
+
+            bot.download(
+                    candidate,
+
+                    new SagarCertificateBot.DownloadListener() {
+
+
+                        // =========================================
+                        // PROFILE READ
+                        // =========================================
+
+                        @Override
+                        public void onProfileRead(
+                                SagarCertificateBot.ProfileDetails profile
+                        ) throws Exception {
+                            if (profile == null) {
+                                return;
+                            }
+
+                            String profileName = clean(profile.candidateName());
+                            String profileMobile = normalizeMobile(profile.mobileNumber());
+
+                            // Fill ONLY blank profile cells. Never replace existing C/D.
+                            if (resolvedName[0].isBlank()
+                                    && !profileName.isBlank()) {
+                                sheet.updateNameVerified(row, profileName);
+                                resolvedName[0] = profileName;
+                                System.out.println(
+                                        "COLUMN C NAME SAVED FROM PROFILE: " + profileName
+                                );
+                            }
+
+                            if (normalizeMobile(candidate.mobileNumber()).isBlank()
+                                    && !profileMobile.isBlank()) {
+                                sheet.updateMobileVerified(row, profileMobile);
+                                System.out.println(
+                                        "COLUMN D WHATSAPP NO SAVED FROM PROFILE: " + profileMobile
+                                );
+                            }
+
+                            if (resolvedMobile[0].isBlank() && !profileMobile.isBlank()) {
+                                resolvedMobile[0] = profileMobile;
+                                System.out.println(
+                                        "CANDIDATE MOBILE RESOLVED FROM PROFILE: "
+                                                + resolvedMobile[0]
+                                );
+                            }
+                        }
+
+                        // =========================================
+                        // DRIVE IS NOT USED
+                        // =========================================
+
+                        @Override
+                        public Set<String> alreadyUploadedCourses() {
+
+                            return Set.of();
+                        }
+
+
+                        // =========================================
+                        // CERTIFICATE DOWNLOADED
+                        // =========================================
+
+                        @Override
+                        public void onCertificateDownloaded(
+                                String courseName,
+                                File certificate
+                        ) throws Exception {
+
+
+                            courseFiles.put(
+                                    courseName,
+                                    certificate
+                            );
+
+
+                            sheet.updateProcessStatus(
+                                    row,
+                                    "RUNNING - DOWNLOADED "
+                                            + courseFiles.size()
+                                            + "/10 - "
+                                            + courseName
+                            );
+
+
+                            System.out.println("DOWNLOADING " + courseFiles.size() + "/10");
+                        }
+
+
+                        // =========================================
+                        // CSV NOT USED
+                        // =========================================
+
+                        @Override
+                        public void onCsvDownloaded(
+                                File csv
+                        ) {
+
+                            // CSV and Drive are not used.
+                        }
+                    }
+            );
+
+
+            // -----------------------------------------------------
+            // VERIFY ALL 10 CERTIFICATES
+            // -----------------------------------------------------
+
+            verifyTenCourses(
+                    courseFiles
+            );
+
+
+            sheet.updateProcessStatus(
+                    row,
+                    "RUNNING - 10/10 DOWNLOADED"
+                            + " - READING INDOS NUMBER"
+            );
+
+
+            // -----------------------------------------------------
+            // READ INDOS
+            // -----------------------------------------------------
+
+            String indos =
+                    CertificateMetadata.extractIndosFromAny(
+                            courseFiles.values()
+                    );
+
+
+            if (indos.isBlank()) {
+
+                throw new IllegalStateException(
+                        "INDoS number not found"
+                                + " inside downloaded certificates"
+                );
+            }
+
+
+            // -----------------------------------------------------
+            // RENAME CERTIFICATES
+            // -----------------------------------------------------
+
+            Map<String, File> renamed =
+                    CertificateMetadata.renameCertificates(
+                            orderedMap(
+                                    courseFiles
+                            ),
+                            "",
+                            indos
+                    );
+
+
+            // -----------------------------------------------------
+            // CREATE ATTACHMENT LIST
+            // -----------------------------------------------------
+
+            List<File> attachments =
+                    new ArrayList<>();
+
+
+            for (String course :
+                    REQUIRED_COURSES) {
+
+                File file =
+                        renamed.get(
+                                course
+                        );
+
+
+                if (file == null
+                        || !file.isFile()
+                        || file.length() <= 0) {
+
+                    throw new IllegalStateException(
+                            "Missing attachment after rename: "
+                                    + course
+                    );
+                }
+
+
+                attachments.add(
+                        file
+                );
+            }
+
+
+            // =====================================================
+            // EMAIL
+            // =====================================================
+
+            MailClient mailClient =
+                    new MailClient();
+
+
+            int resumeAfterBatch =
+                    isAllEmailPartsSent(candidate.processStatus())
+                            ? 1
+                            : 0;
+
+
+            List<List<File>> emailBatches =
+                    mailClient.planBatches(
+                            attachments
+                    );
+
+
+            int totalEmailBatches =
+                    emailBatches.size();
+
+
+            if (resumeAfterBatch
+                    > totalEmailBatches) {
+
+                // Bad/stale marker.
+                // Restart email batching.
+
+                resumeAfterBatch = 0;
+            }
+
+
+            final int[] sentEmailBatches = {
+                    resumeAfterBatch
+            };
+
+
+            final int plannedBatches =
+                    totalEmailBatches;
+
+
+            // -----------------------------------------------------
+            // ONE EMAIL ALREADY SENT
+            // -----------------------------------------------------
+
+            if (resumeAfterBatch
+                    == totalEmailBatches
+                    && totalEmailBatches > 0) {
+
+
+                System.out.println(
+                        "ONE EMAIL WAS ALREADY SENT"
+                                + " - NOT RESENDING"
+                );
+
+
+                emailSent =
+                        true;
+
+
+            } else {
+
+
+                sheet.updateProcessStatus(
+                        row,
+                        "RUNNING - SENDING 10 CERTIFICATES IN ONE EMAIL"
+                );
+
+
+                // =================================================
+                // AGENT CC
+                //
+                // Column L contains agent name.
+                //
+                // Example:
+                //
+                // Column L = Muthu_Punnai
+                //
+                // Config:
+                //
+                // agent.muthu_punnai.email=
+                // spmcomputer2024@gmail.com
+                //
+                // Agent email automatically becomes CC.
+                // =================================================
+
+                String agentName =
+                        clean(
+                                candidate.agentName()
+                        );
+
+
+                String ccEmail =
+                        Config.agentEmail(
+                                agentName
+                        );
+
+
+                if (agentName.isBlank()) {
+
+                    System.out.println(
+                            "COLUMN L AGENT BLANK"
+                                    + " - NO EMAIL CC"
+                    );
+
+                } else if (ccEmail.isBlank()) {
+
+                    System.out.println(
+                            "AGENT EMAIL NOT CONFIGURED"
+                                    + " - NO CC"
+                                    + " | Agent: "
+                                    + agentName
+                    );
 
                 } else {
-                    SheetRepository.updateOverallStatus(row, "Retrying");
-                    System.out.println("USER RUN RETRY QUEUED IMMEDIATELY : " + displayName);
+
+                    System.out.println(
+                            "AGENT EMAIL CC: "
+                                    + agentName
+                                    + " -> "
+                                    + ccEmail
+                    );
                 }
-            } catch (Exception sheetError) {
-                System.out.println("Could not save retry status: " + sheetError.getMessage());
+
+
+                // =================================================
+                // SEND CERTIFICATE EMAIL
+                //
+                // TO:
+                // Candidate email - Column B
+                //
+                // CC:
+                // Agent email from config.properties
+                //
+                // =================================================
+
+                mailClient.sendCertificates(
+
+                        candidate.loginId(),
+
+                        ccEmail,
+
+                        resolvedName[0],
+
+                        indos,
+
+                        attachments,
+
+                        resumeAfterBatch,
+
+                        (sentBatchNumber,
+                         totalBatches) -> {
+
+
+                            sentEmailBatches[0] =
+                                    sentBatchNumber;
+
+
+                            sheet.updateProcessStatus(
+                                    row,
+                                    "EMAIL SENT - ALL 10 CERTIFICATES IN ONE MAIL"
+                            );
+                        }
+                );
+
+
+                emailSent =
+                        sentEmailBatches[0]
+                                >= plannedBatches;
             }
 
-            // Keep console clean: one concise reason instead of a long red stack trace.
-            System.out.println("Reason: " + conciseError(userError));
-        }
-    }
+
+            // -----------------------------------------------------
+            // EMAIL DID NOT FINISH
+            // -----------------------------------------------------
+
+            if (!emailSent) {
+
+                throw new IllegalStateException(
+                        "The single certificate email did not complete"
+                );
+            }
 
 
-    private static boolean isAnyLegacyWaitStatus(String status) {
-        if (status == null || status.isBlank()) {
-            return false;
-        }
+            // -----------------------------------------------------
+            // PROTECT AGAINST DUPLICATE EMAIL
+            // -----------------------------------------------------
 
-        String text = status.trim().toUpperCase(Locale.ENGLISH);
-        return text.startsWith("WAIT ")
-                || text.startsWith("DAY ")
-                || text.contains(" START AFTER ")
-                || text.contains(" WAIT ");
-    }
+            EMAILED_THIS_RUN.add(
+                    row
+            );
 
-    private static boolean isLowMemoryProblem(Throwable error) {
-        for (Throwable current = error; current != null; current = current.getCause()) {
-            String message = current.getMessage();
-            if (message != null) {
-                String text = message.toLowerCase(Locale.ENGLISH);
-                if (text.contains("low system memory")
-                        || text.contains("outofmemory")
-                        || text.contains("out of memory")
-                        || text.contains("cannot allocate memory")
-                        || text.contains("native memory")) {
-                    return true;
+
+            // -----------------------------------------------------
+            // COLUMN I = SENT
+            // -----------------------------------------------------
+
+            sheet.updateMailStatusVerified(
+                    row,
+                    "SENT"
+            );
+            System.out.println("EMAIL SENT");
+
+
+            // -----------------------------------------------------
+            // DELETE TEMP CERTIFICATE FILES AFTER EMAIL SUCCESS
+            // -----------------------------------------------------
+            // The SMTP send has completed and Column I is confirmed SENT.
+            // The PDFs are no longer required locally, so remove all 10 temp
+            // attachments before WhatsApp / Completed-sheet processing.
+            deleteTempCertificateFiles(attachments);
+
+
+            EMAILED_THIS_RUN.remove(
+                    row
+            );
+
+
+            sheet.updateProcessStatus(
+                    row,
+                    "EMAIL SENT"
+                            + " - SENDING WHATSAPP"
+            );
+
+
+            // -----------------------------------------------------
+            // WHATSAPP + MOVE
+            // -----------------------------------------------------
+
+            finishWhatsappAndMove(
+                    sheet,
+                    candidate,
+                    resolvedMobile[0]
+            );
+
+
+            System.out.println("SUCCESS");
+
+
+        } catch (Exception e) {
+
+            String reason =
+                    shortMsg(
+                            e
+                    );
+
+
+            System.err.println(
+                    "ROW "
+                            + row
+                            + " FAILED - WILL RETRY: "
+                            + reason
+            );
+
+
+            e.printStackTrace();
+
+
+            // -----------------------------------------------------
+            // EMAIL ALREADY SENT
+            //
+            // Never resend it.
+            // Only WhatsApp/move may retry.
+            // -----------------------------------------------------
+
+            if (emailSent) {
+
+                EMAILED_THIS_RUN.add(
+                        row
+                );
+
+
+                try {
+
+                    sheet.updateProcessStatus(
+                            row,
+                            "EMAIL SENT"
+                                    + " - WHATSAPP/MOVE WILL RETRY"
+                                    + " - "
+                                    + reason
+                    );
+
+                } catch (Exception ignored) {
+                }
+
+
+            } else {
+
+
+                // -------------------------------------------------
+                // EMAIL FAILED
+                // -------------------------------------------------
+
+                try {
+
+                    sheet.updateMailStatusVerified(
+                            row,
+                            "FAILED"
+                    );
+
+                } catch (Exception statusError) {
+
+                    System.err.println(
+                            "Could not write FAILED to Column I: "
+                                    + shortMsg(
+                                    statusError
+                            )
+                    );
+                }
+
+
+                // -------------------------------------------------
+                // ONE-MAIL MODE: there is no partial batch to resume.
+                // If SMTP had already been accepted, the listener/status
+                // above preserves EMAIL SENT and the next cycle will not resend.
+                // Otherwise retry the complete single email later.
+                // -------------------------------------------------
+
+                try {
+                    String savedStatus = sheet.readProcessStatus(row);
+
+                    if (isAllEmailPartsSent(savedStatus)) {
+                        sheet.updateProcessStatus(
+                                row,
+                                "EMAIL SENT - POST-SEND STEP WILL RETRY - " + reason
+                        );
+                    } else {
+                        sheet.updateProcessStatus(
+                                row,
+                                "FAILED - ONE EMAIL NOT SENT - WILL RETRY AUTOMATICALLY - " + sanitizeReason(reason)
+                        );
+                    }
+                } catch (Exception ignored) {
                 }
             }
 
-            if (current instanceof OutOfMemoryError) {
-                return true;
-            }
+
+            sleep(
+                    RETRY_MS
+            );
         }
-        return false;
     }
 
-    private static boolean isNetworkOrLoginProblem(Throwable error) {
-        for (Throwable current = error; current != null; current = current.getCause()) {
-            String className = current.getClass().getSimpleName().toLowerCase(Locale.ENGLISH);
-            String message = current.getMessage() == null
-                    ? ""
-                    : current.getMessage().toLowerCase(Locale.ENGLISH);
 
-            // IMPORTANT: Selenium TimeoutException is normally just a slow/missing
-            // page element. Do NOT turn every page timeout into a network cooldown.
-            // Only explicit transport/DNS/socket failures are treated as network.
-            if (className.contains("sockettimeout")
-                    || className.contains("unknownhost")
-                    || className.contains("connectexception")
-                    || message.contains("net::")
-                    || message.contains("err_connection")
-                    || message.contains("err_internet")
-                    || message.contains("err_name_not_resolved")
-                    || message.contains("err_network_changed")
-                    || message.contains("connection reset")
-                    || message.contains("connection refused")
-                    || message.contains("connection timed out")
-                    || message.contains("connect timed out")
-                    || message.contains("read timed out")
-                    || message.contains("no route to host")
-                    || message.contains("host is unreachable")
-                    || message.contains("network is unreachable")
-                    || message.contains("failed to establish")) {
-                return true;
-            }
-        }
-        return false;
-    }
+    // =========================================================
+    // WHATSAPP + COMPLETED SHEET
+    // =========================================================
 
-    private static String conciseError(Throwable error) {
-        if (error == null) {
-            return "Unknown";
-        }
-        String message = error.getMessage();
-        if (message == null || message.isBlank()) {
-            return error.getClass().getSimpleName();
-        }
-        String oneLine = message.replaceAll("\\s+", " ").trim();
-        if (oneLine.length() > 220) {
-            oneLine = oneLine.substring(0, 220) + "...";
-        }
-        return error.getClass().getSimpleName() + " - " + oneLine;
-    }
-
-    private static List<String> findIncompleteModules(
-            List<String> statuses
+    /**
+     * Candidate profile / WhatsApp resolution:
+     * 1) use Column D (Name) and Column E (WhatsApp No) when present;
+     * 2) if either is blank, login to SMY in hidden/headless Chrome and read
+     *    the Profile Name + Mobile Number;
+     * 3) write only missing values back to C/D;
+     * 4) never resend email just because profile details had to be resolved later.
+     */
+    private static String resolveCandidateMobileForWhatsapp(
+            SheetRepository sheet,
+            Candidate candidate
     ) {
-        return CONTINUOUS_MODULE_ORDER.stream()
-                .filter(moduleName -> !isModuleCompleted(statuses, moduleName))
-                .toList();
-    }
+        String sheetName = clean(candidate.candidateName());
+        String mobile = normalizeMobile(candidate.mobileNumber());
 
-    private static boolean isModuleCompleted(
-            List<String> statuses,
-            String moduleName
-    ) {
-        int index = SheetRepository.moduleIndexOf(moduleName);
-
-        if (index < 0 || index >= statuses.size()) {
-            return false;
+        // If both C and D are already populated, no Profile visit is required.
+        if (!sheetName.isBlank() && !mobile.isBlank()) {
+            return mobile;
         }
 
-        String status = statuses.get(index);
-        String cleanedStatus = normalize(status);
+        try {
+            System.out.println(
+                    "COLUMN C/D PROFILE DETAILS MISSING - READING PROFILE IN HIDDEN CHROME"
+            );
 
-        // Only ChapterRunner writes this after two website verification passes.
-        return cleanedStatus.equals("completed");
-    }
+            SagarCertificateBot.ProfileDetails profile =
+                    new SagarCertificateBot().readProfileOnly(candidate);
 
-    private static String normalize(String value) {
-        if (value == null) {
-            return "";
+            String profileName = clean(profile.candidateName());
+            String profileMobile = normalizeMobile(profile.mobileNumber());
+
+            // Fill only blanks; never overwrite user-entered sheet values.
+            if (sheetName.isBlank() && !profileName.isBlank()) {
+                sheet.updateNameVerified(candidate.rowNumber(), profileName);
+                sheetName = profileName;
+                System.out.println(
+                        "COLUMN C NAME SAVED FROM PROFILE: " + profileName
+                );
+            }
+
+            if (mobile.isBlank() && !profileMobile.isBlank()) {
+                sheet.updateMobileVerified(candidate.rowNumber(), profileMobile);
+                mobile = profileMobile;
+                System.out.println(
+                        "COLUMN D WHATSAPP NO SAVED FROM PROFILE: " + profileMobile
+                );
+            }
+
+            if (!mobile.isBlank()) {
+                System.out.println(
+                        "CANDIDATE MOBILE READY FOR WHATSAPP: " + mobile
+                );
+                return mobile;
+            }
+
+        } catch (Exception e) {
+            System.err.println(
+                    "PROFILE LOOKUP FAILED - WHATSAPP WILL BE MARKED FAILED: "
+                            + shortMsg(e)
+            );
         }
 
-        return value
-                .trim()
-                .toLowerCase(Locale.ENGLISH)
-                .replaceAll("[^a-z0-9]+", " ")
-                .trim();
+        return mobile;
     }
 
-    private static void markFullyCompleted(
-            int sheetRowNumber,
-            String displayName,
-            String username,
-            String password,
-            String studentName,
-            String mobileNumber
+    private static void finishWhatsappAndMove(
+            SheetRepository sheet,
+            Candidate candidate,
+            String candidateMobile
     ) throws Exception {
-        if (!SheetRepository.areAllModulesCompleted(sheetRowNumber)) {
-            System.out.println("FINAL COMPLETION CHECK FAILED - one or more modules still pending.");
-            SheetRepository.formatPendingRow(sheetRowNumber);
+
+        int row = candidate.rowNumber();
+        String agent = clean(candidate.agentName());
+        String currentStatus = clean(candidate.whatsappStatus());
+
+        /*
+         * IMPORTANT:
+         * Column I = SENT means the certificate email is already finished.
+         * From this point onward the bot MUST NOT download certificates or
+         * send the email again. It only completes the pending WhatsApp work.
+         *
+         * If WhatsApp fails, keep the row in the current sheet with Column I
+         * still SENT. The continuous watcher will pick it again and retry ONLY
+         * WhatsApp. A successful candidate/agent WhatsApp is persisted in
+         * Column J so it is never sent twice on a retry.
+         */
+        String upper = currentStatus.toUpperCase();
+
+        boolean allWhatsappDone = "SENT".equalsIgnoreCase(currentStatus);
+        boolean candidateDone = allWhatsappDone || upper.contains("CANDIDATE SENT");
+        boolean agentDone = agent.isBlank()
+                || allWhatsappDone
+                || upper.contains("AGENT SENT");
+
+        boolean candidateFailed = false;
+        boolean agentFailed = false;
+
+        WhatsAppClient whatsapp = new WhatsAppClient();
+
+        // =========================================================
+        // CANDIDATE WHATSAPP - COLUMN D OR PROFILE FALLBACK
+        // =========================================================
+        if (!candidateDone) {
+            if (candidateMobile == null || candidateMobile.isBlank()) {
+                candidateFailed = true;
+                System.err.println("CANDIDATE WHATSAPP SKIPPED - NO MOBILE IN COLUMN D OR PROFILE");
+            } else {
+                try {
+                    sheet.updateProcessStatus(
+                            row,
+                            "EMAIL SENT - SENDING WHATSAPP TO CANDIDATE"
+                    );
+
+                    whatsapp.sendCandidateNotification(candidateMobile);
+                    candidateDone = true;
+
+                    // Persist this immediately. If a later agent/move step fails,
+                    // candidate WhatsApp will NOT be repeated on the retry.
+                    sheet.updateWhatsappStatusVerified(row, "CANDIDATE SENT");
+
+                    System.out.println("WHATSAPP SENT");
+
+                } catch (Exception e) {
+                    candidateFailed = true;
+                    System.err.println(
+                            "CANDIDATE WHATSAPP FAILED - CONTINUING: " + shortMsg(e)
+                    );
+                }
+            }
+        } else {
+            System.out.println("CANDIDATE WHATSAPP ALREADY SENT - NOT RESENDING");
+        }
+
+        // =========================================================
+        // OPTIONAL AGENT WHATSAPP - COLUMN L
+        // =========================================================
+        if (!agent.isBlank() && !agentDone) {
+            String agentNumber = Config.agentNumber(agent);
+
+            if (agentNumber.isBlank()) {
+                agentFailed = true;
+                System.err.println(
+                        "AGENT WHATSAPP NOT CONFIGURED - CONTINUING | Agent: " + agent
+                );
+            } else {
+                try {
+                    sheet.updateProcessStatus(
+                            row,
+                            "EMAIL SENT - SENDING AGENT WHATSAPP: " + agent
+                    );
+
+                    whatsapp.sendAgentNotification(agentNumber, agent);
+                    agentDone = true;
+
+                    // Persist agent success immediately. This protects against
+                    // duplicates if the final Completed-sheet move fails.
+                    String partial = candidateDone
+                            ? "CANDIDATE SENT | AGENT SENT"
+                            : "CANDIDATE FAILED | AGENT SENT";
+                    sheet.updateWhatsappStatusVerified(row, partial);
+
+                    System.out.println(
+                            "AGENT WHATSAPP SENT: " + agent + " -> " + agentNumber
+                    );
+
+                } catch (Exception e) {
+                    agentFailed = true;
+                    System.err.println(
+                            "AGENT WHATSAPP FAILED - CONTINUING | "
+                                    + agent + " | " + shortMsg(e)
+                    );
+                }
+            }
+        } else if (agent.isBlank()) {
+            System.out.println("COLUMN L AGENT BLANK - NO AGENT WHATSAPP REQUIRED");
+        } else {
+            System.out.println("AGENT WHATSAPP ALREADY SENT - NOT RESENDING: " + agent);
+        }
+
+        // =========================================================
+        // FINAL WHATSAPP STATUS
+        // =========================================================
+        String whatsappResult;
+
+        if (candidateDone && agentDone) {
+            whatsappResult = "SENT";
+        } else if (candidateDone && !agentDone) {
+            whatsappResult = "CANDIDATE SENT | AGENT FAILED";
+        } else if (!candidateDone && agentDone && !agent.isBlank()) {
+            whatsappResult = "CANDIDATE FAILED | AGENT SENT";
+        } else {
+            whatsappResult = "FAILED";
+        }
+
+        sheet.updateWhatsappStatusVerified(row, whatsappResult);
+
+        // =========================================================
+        // IF WHATSAPP IS NOT COMPLETE: LEAVE ROW HERE
+        // =========================================================
+        // Column I remains SENT, so the next watcher pass will enter the
+        // "Column I already SENT" branch and retry ONLY the missing WhatsApp.
+        if (!"SENT".equalsIgnoreCase(whatsappResult)) {
+            String retryMessage = "EMAIL ALREADY SENT - WHATSAPP "
+                    + whatsappResult
+                    + " - RETRY WHATSAPP ONLY";
+
+            sheet.updateProcessStatus(row, retryMessage);
+
+            System.err.println(
+                    "WHATSAPP NOT COMPLETE - ROW KEPT IN CURRENT SHEET"
+                            + " | Column I remains SENT"
+                            + " | status: " + whatsappResult
+            );
             return;
         }
 
-        SheetRepository.updateOverallStatus(
-                sheetRowNumber,
-                "Completed"
+        String completionMessage = agent.isBlank()
+                ? "COMPLETED - EMAIL + CANDIDATE WHATSAPP SENT - MOVING ROW"
+                : "COMPLETED - EMAIL + CANDIDATE + AGENT WHATSAPP SENT - MOVING ROW";
+
+        sheet.updateProcessStatus(row, completionMessage);
+
+        // =========================================================
+        // COLUMN M = COMPLETED DATE/TIME
+        // =========================================================
+        String completedAt = ZonedDateTime
+                .now(INDIA_ZONE)
+                .format(COMPLETED_AT_FORMAT);
+
+        String savedCompletedAt = sheet.updateCompletedDateTimeIfBlank(
+                row,
+                completedAt
         );
 
-        SheetRepository.formatCompletedRow(sheetRowNumber);
+        System.out.println("COLUMN M COMPLETED DATE/TIME: " + savedCompletedAt);
 
-        // After final completion, queue the candidate in "Download certificate":
-        // A = Date Entry (IST), B = username/email, C = SMY Password, D = Name, E = Mobile.
-        // If PC1 D/E are still blank, the completed-row profile sync fills PC1 and
-        // the next poll automatically repairs the queue row without duplicating it.
-        // Do not clear PC1; the original completed row remains as the audit record.
-        try {
-            SheetRepository.copyCompletedCandidateToDownloadCertificate(
-                    sheetRowNumber,
-                    username,
-                    password,
-                    studentName,
-                    mobileNumber
+        // =========================================================
+        // MOVE A:M TO COMPLETED
+        // =========================================================
+        // Move only after WhatsApp is fully SENT. If WhatsApp failed earlier,
+        // the row stayed here with Column I = SENT and email was never resent.
+        sheet.moveToCompleted(row);
+
+        System.out.println(
+                "MOVED TO COMPLETED SHEET: source row " + row
+                        + " | WhatsApp status: " + whatsappResult
+        );
+    }
+
+    // =========================================================
+    // DELETE TEMP CERTIFICATES AFTER EMAIL SUCCESS
+    // =========================================================
+
+    private static void deleteTempCertificateFiles(List<File> attachments) {
+        if (attachments == null || attachments.isEmpty()) {
+            return;
+        }
+
+        int deleted = 0;
+
+        for (File file : attachments) {
+            if (file == null) {
+                continue;
+            }
+
+            try {
+                if (Files.deleteIfExists(file.toPath())) {
+                    deleted++;
+                    System.out.println(
+                            "TEMP CERTIFICATE DELETED AFTER EMAIL: " + file.getName()
+                    );
+                }
+            } catch (Exception e) {
+                // Email is already sent. A local cleanup problem must never make
+                // the bot send the email again. Log it and continue.
+                System.err.println(
+                        "TEMP CERTIFICATE DELETE FAILED - CONTINUING: "
+                                + file.getAbsolutePath() + " | " + shortMsg(e)
+                );
+            }
+        }
+
+        System.out.println(
+                "TEMP CERTIFICATE CLEANUP: " + deleted + "/"
+                        + attachments.size() + " file(s) deleted after email."
+        );
+    }
+
+
+    // =========================================================
+    // VERIFY ALL 10 CERTIFICATES
+    // =========================================================
+
+    private static void verifyTenCourses(
+            Map<String, File> courseFiles
+    ) {
+
+
+        Set<String> missing =
+                new LinkedHashSet<>();
+
+
+        for (String course :
+                REQUIRED_COURSES) {
+
+
+            File file =
+                    courseFiles.get(
+                            course
+                    );
+
+
+            if (file == null
+                    || !file.isFile()
+                    || file.length() <= 0) {
+
+
+                missing.add(
+                        course
+                );
+            }
+        }
+
+
+        if (!missing.isEmpty()) {
+
+
+            throw new IllegalStateException(
+
+                    "Only "
+                            + (
+                            10
+                                    - missing.size()
+                    )
+                            + "/10 certificates downloaded."
+                            + " Missing: "
+                            + String.join(
+                            ", ",
+                            missing
+                    )
             );
-        } catch (Exception queueError) {
-            System.out.println(
-                    "CERTIFICATE QUEUE COPY FAILED | ROW " + sheetRowNumber
-                            + " | " + conciseError(queueError)
+        }
+    }
+
+
+    // =========================================================
+    // ORDER FILES IN REQUIRED COURSE ORDER
+    // =========================================================
+
+    private static Map<String, File> orderedMap(
+            Map<String, File> source
+    ) {
+
+
+        Map<String, File> result =
+                new LinkedHashMap<>();
+
+
+        for (String course :
+                REQUIRED_COURSES) {
+
+
+            result.put(
+                    course,
+                    source.get(
+                            course
+                    )
             );
         }
 
 
-        System.out.println();
-        System.out.println("============================================");
-        System.out.println("ALL 10 MODULES COMPLETED");
-        System.out.println("USER : " + displayName);
-        System.out.println("============================================");
+        return result;
     }
 
-    private static void printSchedule() {
-        System.out.println();
-        System.out.println("====================================");
-        System.out.println(" YOGA MULTI-PC CONTINUOUS NO-GAP MODE");
-        System.out.println(" Workers       : " + MAX_PARALLEL_USERS);
-        System.out.println(" Sheet         : PC" + MachineShard.pcId());
-        System.out.println(" Browser UI    : HIDDEN (HEADLESS)");
-        System.out.println(" Browser load  : UP TO 4 ACTIVE HEADLESS SESSIONS (RAM-GUARDED)");
-        System.out.println(" PC workers    : " + MAX_PARALLEL_USERS + " ACTIVE USER(S) ON THIS PC; NO MODULE GAP");
-        System.out.println(" Sheet refresh : 3 seconds");
-        System.out.println(" Module order  : Emotional -> Economic -> Physical -> Social");
-        System.out.println("                 -> Occupational -> Environmental -> Intellectual");
-        System.out.println("                 -> Spiritual -> Climatic -> Cultural");
-        System.out.println(" Module gap    : NONE");
-        System.out.println(" Run limit     : STRICT ONE-BY-ONE UNTIL ALL COMPLETE");
-        System.out.println(" Day schedule  : REMOVED");
-        System.out.println(" 24-hour gap   : REMOVED");
-        System.out.println(" Priority      : NORMAL PC" + MachineShard.pcId() + " SHEET ORDER");
-        System.out.println(" Module check  : WEBSITE HEADER STATUS IS FINAL TRUTH");
-        System.out.println(" Retry delay   : NONE - next worker pass immediately");
-        System.out.println(" 429 protection: G:P bulk reads + quota retry");
-        System.out.println("====================================");
-    }
 
-    private static void sleepSafely(long milliseconds) {
-        try {
-            Thread.sleep(milliseconds);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+    // =========================================================
+    // NORMALIZE MOBILE TO LAST 10 DIGITS
+    // =========================================================
+
+    private static String normalizeMobile(
+            String value
+    ) {
+
+
+        if (value == null) {
+
+            return "";
         }
+
+
+        String digits =
+                value.replaceAll(
+                        "\\D",
+                        ""
+                );
+
+
+        if (digits.isBlank()) {
+
+            return "";
+        }
+
+
+        /*
+         * Examples:
+         *
+         * 09677577715
+         * ->
+         * 9677577715
+         *
+         * +91 9677577715
+         * ->
+         * 9677577715
+         *
+         * 919677577715
+         * ->
+         * 9677577715
+         */
+
+
+        while (digits.length() > 10
+                && digits.startsWith("0")) {
+
+
+            digits =
+                    digits.substring(
+                            1
+                    );
+        }
+
+
+        if (digits.length() > 10) {
+
+
+            digits =
+                    digits.substring(
+                            digits.length() - 10
+                    );
+        }
+
+
+        return digits.length() == 10
+                ? digits
+                : "";
     }
 
-    private static int intSetting(String key, int defaultValue) {
-        String value = System.getenv(key);
-        if (value == null || value.isBlank()) value = System.getProperty(key);
-        if (value == null || value.isBlank()) return defaultValue;
+
+    // =========================================================
+    // SAFE STRING
+    // =========================================================
+
+    private static String clean(
+            String value
+    ) {
+
+
+        return value == null
+                ? ""
+                : value.trim();
+    }
+
+
+    // =========================================================
+    // EMAIL STATUS HELPERS
+    // =========================================================
+
+    private static boolean isAllEmailPartsSent(
+            String processStatus
+    ) {
+
+
+        if (processStatus == null
+                || processStatus.isBlank()) {
+
+
+            return false;
+        }
+
+
+        String upper = processStatus.toUpperCase();
+
+        return upper.startsWith("EMAIL SENT")
+                || upper.contains("ALL EMAIL PARTS SENT");
+    }
+
+
+    private static int parseSentEmailBatch(
+            String processStatus
+    ) {
+
+
+        if (processStatus == null
+                || processStatus.isBlank()) {
+
+
+            return 0;
+        }
+
+
+        Matcher matcher =
+                Pattern.compile(
+
+                        "EMAIL\\s+"
+                                + "(?:PART|BATCH)"
+                                + "\\s+(\\d+)"
+                                + "(?:\\s*/\\s*\\d+)?"
+                                + "\\s+SENT",
+
+                        Pattern.CASE_INSENSITIVE
+
+                ).matcher(
+                        processStatus
+                );
+
+
+        int highest =
+                0;
+
+
+        while (matcher.find()) {
+
+
+            try {
+
+
+                highest =
+                        Math.max(
+
+                                highest,
+
+                                Integer.parseInt(
+                                        matcher.group(
+                                                1
+                                        )
+                                )
+                        );
+
+
+            } catch (NumberFormatException ignored) {
+            }
+        }
+
+
+        return highest;
+    }
+
+
+    // =========================================================
+    // AGENT EMAIL FOR LOG
+    // =========================================================
+
+    private static String ccEmailForLog(
+            Candidate candidate
+    ) {
+
+
         try {
-            int parsed = Integer.parseInt(value.trim());
-            return Math.max(1, Math.min(8, parsed));
+
+
+            String email =
+                    Config.agentEmail(
+                            clean(
+                                    candidate.agentName()
+                            )
+                    );
+
+
+            return email.isBlank()
+                    ? "NONE"
+                    : email;
+
+
         } catch (Exception e) {
-            return defaultValue;
+
+
+            return "NONE";
         }
     }
 
+
+    private static String sanitizeReason(String reason) {
+        if (reason == null || reason.isBlank()) return "Unknown error";
+        String t = reason.replaceAll("\\s+", " ").trim();
+        if (t.toLowerCase().contains("timeoutexception") || t.toLowerCase().contains("timeout")) {
+            return "TIMEOUT";
+        }
+        int build = t.indexOf("Build info:");
+        if (build >= 0) t = t.substring(0, build).trim();
+        return t.length() <= 120 ? t : t.substring(0, 120);
+    }
+
+    // =========================================================
+    // SHORT ERROR MESSAGE
+    // =========================================================
+
+    private static String shortMsg(
+            Exception e
+    ) {
+
+
+        if (e instanceof java.util.concurrent.TimeoutException
+                || e instanceof org.openqa.selenium.TimeoutException) {
+            return "TIMEOUT - will retry automatically";
+        }
+
+        String text =
+                e.getMessage();
+
+
+        if (text == null
+                || text.isBlank()) {
+
+
+            text =
+                    e.getClass()
+                            .getSimpleName();
+        }
+
+
+        text =
+                text.replaceAll(
+                        "\\s+",
+                        " "
+                ).trim();
+
+
+        return text.length() <= 180
+
+                ? text
+
+                : text.substring(
+                0,
+                180
+        );
+    }
+
+    // =========================================================
+    // SAFE SLEEP
+    // =========================================================
+
+    private static void sleep(
+            long ms
+    ) {
+
+
+        try {
+
+
+            Thread.sleep(
+                    ms
+            );
+
+
+        } catch (InterruptedException e) {
+
+
+            Thread.currentThread()
+                    .interrupt();
+        }
+    }
 }
