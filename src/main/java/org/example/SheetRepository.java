@@ -10,8 +10,6 @@ import com.google.api.services.sheets.v4.model.CellData;
 import com.google.api.services.sheets.v4.model.CellFormat;
 import com.google.api.services.sheets.v4.model.Color;
 import com.google.api.services.sheets.v4.model.GridRange;
-import com.google.api.services.sheets.v4.model.DeleteDimensionRequest;
-import com.google.api.services.sheets.v4.model.DimensionRange;
 import com.google.api.services.sheets.v4.model.RepeatCellRequest;
 import com.google.api.services.sheets.v4.model.Request;
 import com.google.api.services.sheets.v4.model.Sheet;
@@ -189,16 +187,49 @@ public final class SheetRepository {
 
             GoogleCredentials credentials;
 
-            try (FileInputStream input =
-                         new FileInputStream(CREDENTIALS_FILE)) {
+            String railwayCredentials =
+                    System.getenv("GOOGLE_CREDENTIALS_JSON");
 
-                credentials = GoogleCredentials
-                        .fromStream(input)
-                        .createScoped(
-                                Collections.singleton(
-                                        SheetsScopes.SPREADSHEETS
-                                )
-                        );
+            if (railwayCredentials != null
+                    && !railwayCredentials.isBlank()) {
+
+                try (java.io.InputStream input =
+                             new java.io.ByteArrayInputStream(
+                                     railwayCredentials.getBytes(
+                                             java.nio.charset.StandardCharsets.UTF_8
+                                     )
+                             )) {
+
+                    credentials = GoogleCredentials
+                            .fromStream(input)
+                            .createScoped(
+                                    Collections.singleton(
+                                            SheetsScopes.SPREADSHEETS
+                                    )
+                            );
+                }
+
+                System.out.println(
+                        "GOOGLE SHEETS AUTH: Railway environment variable"
+                );
+
+            } else {
+
+                try (FileInputStream input =
+                             new FileInputStream(CREDENTIALS_FILE)) {
+
+                    credentials = GoogleCredentials
+                            .fromStream(input)
+                            .createScoped(
+                                    Collections.singleton(
+                                            SheetsScopes.SPREADSHEETS
+                                    )
+                            );
+                }
+
+                System.out.println(
+                        "GOOGLE SHEETS AUTH: local credentials.json"
+                );
             }
 
             sheetsService = new Sheets.Builder(
@@ -1111,76 +1142,6 @@ public final class SheetRepository {
                         + " | E MOBILE=" + (cleanMobile.isBlank() ? "PENDING" : cleanMobile)
         );
     }
-
-    /**
-     * Compatibility method used by Main after a Wellness candidate finishes.
-     * It queues the candidate in the "Download certificate" sheet first,
-     * then deletes the source PC row so the candidate is actually moved.
-     *
-     * Source PC columns used:
-     * A = Date Entry, B = username/email, C = SMY password,
-     * D = name, E = mobile.
-     */
-    public static synchronized void moveToCompleted(int rowNumber) throws Exception {
-        String sourceRange = USER_SHEET + "!A" + rowNumber + ":E" + rowNumber;
-
-        ValueRange source = withQuotaRetry(
-                () -> getSheetsService()
-                        .spreadsheets()
-                        .values()
-                        .get(SPREADSHEET_ID, sourceRange)
-                        .execute()
-        );
-
-        List<List<Object>> values = source.getValues();
-        if (values == null || values.isEmpty()) {
-            throw new IllegalStateException(
-                    "Source row is empty; not moved: " + USER_SHEET + " row " + rowNumber
-            );
-        }
-
-        List<Object> row = values.get(0);
-        String username = getCell(row, 1);
-        String password = getCell(row, 2);
-        String name = getCell(row, 3);
-        String mobile = getCell(row, 4);
-
-        // Append/repair the Download certificate queue BEFORE deleting the source.
-        copyCompletedCandidateToDownloadCertificate(
-                rowNumber, username, password, name, mobile
-        );
-
-        DeleteDimensionRequest delete = new DeleteDimensionRequest()
-                .setRange(new DimensionRange()
-                        .setSheetId(getUserSheetId())
-                        .setDimension("ROWS")
-                        .setStartIndex(rowNumber - 1)
-                        .setEndIndex(rowNumber));
-
-        withQuotaRetry(
-                () -> getSheetsService()
-                        .spreadsheets()
-                        .batchUpdate(
-                                SPREADSHEET_ID,
-                                new BatchUpdateSpreadsheetRequest()
-                                        .setRequests(List.of(
-                                                new Request().setDeleteDimension(delete)
-                                        ))
-                        )
-                        .execute()
-        );
-
-        // Row numbers shift after deletion, so row-number caches must be rebuilt.
-        MODULE_STATUS_CACHE.clear();
-        OVERALL_STATUS_CACHE.clear();
-        PENDING_FORMATTED_ROWS.clear();
-        COMPLETED_FORMATTED_ROWS.clear();
-
-        System.out.println(
-                "MOVED TO DOWNLOAD CERTIFICATE | " + USER_SHEET + " ROW " + rowNumber
-        );
-    }
-
 
     private static boolean looksLikeMobile(String value) {
         if (value == null) {
